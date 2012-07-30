@@ -1,0 +1,5 @@
+*.ncb
+*.user
+*.pdb
+/OpenCV\autoCut\Debug/*.idb
+/OpenCV\autoCut\Debug/*.pch
