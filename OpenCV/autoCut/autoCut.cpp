@@ -12,17 +12,14 @@ using namespace std;
 
 enum LineStyles { lnEdge };
 
-Mat src, src_gray, src_hue;
-Mat dst;
-Mat edges_gray, edges_hue;
+Mat src, src_lab, src_gray, src_diff;
+Mat dst, dst_canny, dst_hough;
+Mat edges_gray;
 Mat hough;
 
 int edgeThresh = 1;
-int lowThreshold;
-int const max_lowThreshold = 100;
-int ratio[2] = { 5, 2 };  // Ratio = multipler / divisor
-int kernel_size = 3;
-char* window_canny = "Edge Map";
+int lowThreshold = 2;
+int const max_lowThreshold = 20;
 char* window_hough = "Detected Lines";
 
 // Lines found
@@ -36,37 +33,10 @@ void print_help()
 void draw_line( Mat& image, Point start, Point end, int style = lnEdge )
 {
 	switch( style ) {
-		case lnEdge: cv::line( image, start, end, Scalar( 0, 0, 255 ), 2, CV_AA ); break; 
+		case lnEdge: cv::line( image, start, end, Scalar( 0, 128, 255 ), 2, CV_AA ); break; 
 	}
 }
 
-
-void performCanny()
-{
-	// a vertical blur
-	Size blur_kernel( 3, 3 ); 
-
-	// Reduce noise and detect for light channel
-	blur( src_gray, edges_gray, blur_kernel );
-
-	Canny( edges_gray, edges_gray, 
-		lowThreshold, lowThreshold * ratio[0] / ratio[1], 
-		kernel_size );
-
-	// Reduce noise and detect for hue channel
-	blur( src_hue, edges_hue, blur_kernel );
-
-	Canny( edges_hue, edges_hue, 
-		lowThreshold, lowThreshold * ratio[0] / ratio[1], 
-		kernel_size );
-
-	// Using Canny's output as a mask, we display our result
-	dst = Scalar::all(0);
-
-	//cv::addWeighted( edges_hue, 0.5, edges_gray, 0.5, 1.0, edges_gray );
-	cv::add( edges_hue, edges_gray, edges_gray );
-
-}
 
 template<typename T> struct AxisAlignedPred {
 	typedef T argument_type;
@@ -75,53 +45,88 @@ template<typename T> struct AxisAlignedPred {
 	}
 };
 
-void performHough()
+template<typename T> void performAccum( Mat& img )
 {
-	const int dilation_size = 1;
-	const int distResolution = 2;
-	const double angleResolution = CV_PI / 32;
-	const int minLineLength = 80;
+	int imgWidth = img.cols;
+	vector<float> accum( imgWidth ), momentum( imgWidth ), prevLine( imgWidth );
+	MatIterator_<T> it, end;
+	vector<float>::iterator acIt, acEnd, mmIt, mmEnd, lnIt, lnEnd;
 
-	//cvtColor( edges_gray, hough, CV_GRAY2BGR );
-	Mat element = getStructuringElement( MORPH_CROSS,
-		Size( 2*dilation_size + 1, 2*dilation_size+1 ),
-		Point( dilation_size, dilation_size ) );
+	accum.resize( imgWidth );
+	for( it = img.begin<T>(), end = img.end<T>(); it != end; )
+	{
+		for ( acIt = accum.begin(), acEnd = accum.end(), 
+				mmIt = momentum.begin(), mmEnd = momentum.end(),
+				lnIt = prevLine.begin(), lnEnd = prevLine.end();
+				acIt != acEnd && mmIt != mmEnd && lnIt != lnEnd && it != end;
+				++acIt, ++mmIt, ++lnIt, ++it )
+		{
+			*acIt += *it;
+			if ( *it > 0.01 ) {
+				*acIt += *mmIt;
+				*mmIt += *it;
+				*mmIt *= (float)1.025;  // stability bonus
+			} else {
+				if ( *mmIt > 1 ) *mmIt /= 2;
+				else *mmIt = 0;
+			}
+		}
+	}
 
-	// Apply the erosion operation
-	dilate( edges_gray, hough, element, Point(-1,-1), 2 );	
-	//edges_gray.assignTo( hough );
+	// Sort found lines according to accumulator
+	using namespace boost;
+	struct Rank {
+		int pos;
+		float value;
+		bool operator >( const Rank& rhs ) const { return value > rhs.value; }
+		bool inRange( const Rank& rhs ) const { 
+			int p1 = pos;
+			int p2 = rhs.pos;
+			return fast_abs( p1 - p2 ) < 5; 
+		}
+	};
+	vector<Rank> rank;
+	// omit border lines
+	for ( int i = 10; i < img.cols-10; ++i )
+	{
+		Rank r = { i, accum[i] };
+		rank.push_back( r );
+	}
+	std::sort( rank.begin(), rank.end(), std::greater<Rank>() );
 
-	lines.clear();
-	HoughLinesP( hough, lines, distResolution, angleResolution, minLineLength, minLineLength, 10 );
+	// Store all found lines in order of appearance
+	for ( size_t i = 0; i < rank.size(); ++i )
+	{
+		// skip neighbouring lines
+		if ( i != 0 ) {
+			vector<Rank>::iterator rank_end = rank.begin() + i;
+			if ( std::find_if( rank.begin(), rank_end, 
+				bind( &Rank::inRange, &rank[i], _1 ) ) != rank_end )
+				continue;
+		}
 
-	// Leave only axially-aligned lines
-	//std::remove_if( lines.begin(), lines.end(), ( AxisAlignedPred<Vec4i>() ) );	
+		lines.push_back( Vec4i( rank[i].pos, 0, rank[i].pos, img.rows ) );
+	}
+
 }
 
 // Redisplay image
 void redraw()
 {
-	// Draw Canny window
-	//src.copyTo( dst, edges_gray);
-	cvtColor( edges_gray, dst, CV_GRAY2BGR );
-	imshow( window_canny, dst );
-
-	src.copyTo( dst );
-	for( size_t i = 0; i < lines.size(); i++ )
+	src.copyTo( dst_hough );
+	for ( int i = 0; i < std::min<int>( lowThreshold, (int)lines.size() ); ++i )
 	{
 		Vec4i l = lines[ i ];
-		if ( AxisAlignedPred<Vec4i>()( l ) )
-			draw_line( dst, Point( l[0], l[1] ), Point( l[2], l[3] ) );
+		draw_line( dst_hough, Point( l[0], l[1] ), Point( l[2], l[3] ) );
 	}
 
-	imshow( window_hough, dst );
+	imshow( window_hough, dst_hough );
 }
 
 // Callback, performing Canny detector
 void trackbarCallback(int, void*)
 {
-	performCanny();
-	performHough();
+
 	redraw();
 }
 
@@ -153,28 +158,66 @@ int _tmain(int argc, _TCHAR* argv[])
 	// Create a matrix of the same type and size as src (for dst)
 	dst.create( src.size(), src.type() );
 
-	// I'd like to track color and luminosity changes separately
+	
+
+	// Now I'd like to convert to CIELab space to track "perceptive" 
+	// difference between neighbouring rows or columns
 	{
-		Mat src_hsv;
-		cvtColor( src, src_hsv, CV_BGR2HSV );
-		ExtractChannel( src_hsv, src_hue, 0 );
-		ExtractChannel( src_hsv, src_gray, 2 );
+		Mat tmp( src.rows, src.cols, CV_32FC3 );
+		cvtColor( src, tmp, CV_BGR2Lab );
+		tmp.copyTo( src_lab );
 	}
 
-	// Convert the image to grayscale
-	//cvtColor( src, src_gray, CV_BGR2GRAY );
+	// In order to grab the "perceptive" difference I need differences
+	// for each channel
+	// Subtract neighbouring pixels with a kernel [1 -1]
+	/*Mat kernel = (Mat_<double>( 3, 3) <<  0,  0,  0,
+										  0,  1, -1,
+										  0,  0,  0); // */
+	Mat kernel = (Mat_<double>( 2, 2) <<  1,  -1,
+										  1,  -1 );   // */
+	filter2D( src_lab, src_diff, CV_32FC3, kernel, Point(0,0) );  // */
+
+	// we have per-channel differences, all it takes now is to square them and add together
+	{
+		Mat mul_mat;
+		vector<Mat> chans(3);
+
+		// Square + bring to range [0..1]
+		multiply( src_diff, src_diff, mul_mat, 1.0 / 65536, CV_32FC3 );
+
+		split( mul_mat, chans );
+		add( chans[0], chans[1], src_gray );
+		add( chans[2], src_gray, src_gray );
+
+		src_gray /= 3;
+
+		cv::sqrt( src_gray, src_gray );
+		//src_gray *= 4;
+		//multiply( src_gray, src_gray, src_gray );
+	}
+
+	// Line detecting accumulator
+	performAccum<float>( src_gray );
+
+	//src.copyTo( src_diff );
+	cvtColor( src_gray, src_diff, CV_GRAY2BGR );
+	multiply( src, src_diff, src_diff, 1, CV_8UC1 );
+	namedWindow( "Diff", CV_WINDOW_AUTOSIZE );
+	imshow( "Diff", src_diff );
+
+	// Guess the number of lines
+	lowThreshold = cvRound( (double)src.cols / src.rows - 0.25 ) - 1;
 
 	// Create a window
-	namedWindow( window_canny, CV_WINDOW_AUTOSIZE );
+	//namedWindow( window_canny, CV_WINDOW_AUTOSIZE );
 	namedWindow( window_hough, CV_WINDOW_AUTOSIZE );
 
 	// Create a Trackbar for user to enter threshold
-	createTrackbar( "Min Threshold:", window_canny, &lowThreshold, max_lowThreshold, trackbarCallback );
+	createTrackbar( "Min Threshold:", window_hough, &lowThreshold, max_lowThreshold, trackbarCallback );
 
 	// Detect edges and redisplay image
 	trackbarCallback(0, 0);
-	//namedWindow( "Source", CV_WINDOW_AUTOSIZE );
-	//imshow( "Source", src_hue );
 
 	waitKey( 0 );
 	
