@@ -7,12 +7,14 @@
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/highgui/highgui.hpp>
 
+#include "extStuff.h" 
+
 using namespace cv;
 using namespace std; 
 
 enum LineStyles { lnEdge };
 
-Mat src, src_lab, src_gray, src_diff;
+Mat src, src_lab, src_gray;
 Mat dst, dst_canny, dst_hough;
 Mat edges_gray;
 Mat hough;
@@ -21,9 +23,15 @@ int edgeThresh = 1;
 int lowThreshold = 2;
 int const max_lowThreshold = 20;
 char* window_hough = "Detected Lines";
+char* trackbar_name = "Min Threshold:";
 
 // Lines found
 vector<Vec4i> lines;
+
+struct MouseCapture {
+	bool mouseDown;
+	int lineId;
+} mouseCapture;
 
 
 void print_help()
@@ -52,7 +60,8 @@ template<typename T> void performAccum( Mat& img )
 	MatIterator_<T> it, end;
 	vector<float>::iterator acIt, acEnd, mmIt, mmEnd, lnIt, lnEnd;
 
-	accum.resize( imgWidth );
+	// go over the image pixels and accumulate all vertical lines
+	// We give boost "bonus" for an uninterrupted line - the longer, the better.
 	for( it = img.begin<T>(), end = img.end<T>(); it != end; )
 	{
 		for ( acIt = accum.begin(), acEnd = accum.end(), 
@@ -65,8 +74,9 @@ template<typename T> void performAccum( Mat& img )
 			if ( *it > 0.01 ) {
 				*acIt += *mmIt;
 				*mmIt += *it;
-				*mmIt *= (float)1.025;  // stability bonus
+				*mmIt *= (float)1.025;  // steady exponential growth
 			} else {
+				// if line is broken - quickly decay the bonus
 				if ( *mmIt > 1 ) *mmIt /= 2;
 				else *mmIt = 0;
 			}
@@ -130,13 +140,123 @@ void trackbarCallback(int, void*)
 	redraw();
 }
 
-// Extract a single channel (zero-based)
-void ExtractChannel( Mat& src, Mat& dest, unsigned channel )
+int trackDivider( int x, int y )
 {
-	vector<Mat> chans(3);	
-	split( src, chans );
-	assert( channel < chans.size() );
-	chans[channel].assignTo( dest );
+	// Find the nearest line (not only displayed)
+	Vec4i nearest(-1,-1,-1,-1);
+	int counter(0);
+
+	vector<Vec4i>::const_iterator it, itEnd;
+	for ( it = lines.begin(), itEnd = lines.end();
+		it != itEnd && counter < lowThreshold; ++it, ++counter )
+	{
+		if ( fast_abs( (*it)[0] - x ) <= 2 ) 
+		{
+			nearest = *it;
+			return counter;
+		}
+	}
+
+	return -1;
+}
+
+void lookupImage( int x, int y )
+{
+	// Extract a corresponding image part
+	// To do this, we should find closest bounding lines
+	Vec4i lowLine(0,0,0,src.rows-1), highLine(src.cols-1,0,src.cols,src.rows);
+	
+	vector<Vec4i>::const_iterator it, itEnd;
+	for ( it = lines.begin(), itEnd = lines.begin() + lowThreshold;
+		it != itEnd; ++it )
+	{
+		if ( (*it)[0] < x && lowLine[0] < (*it)[0] )
+			lowLine = *it;
+		if ( (*it)[0] > x && highLine[0] > (*it)[0] )
+			highLine = *it;
+	}
+
+	// Extract the region
+	Rect roi( lowLine[0], lowLine[1], highLine[2] - lowLine[0], highLine[3] );
+	Mat subimg = src( roi );
+
+	googleSearch( subimg );
+}
+
+void actOnDivider( int x, int y, int divider, bool clicked )
+{
+	//if ( divider >= 0 && mouseCapture.lineId == -1 )
+	//	mouseCapture.lineId = counter;
+	//else if ( displayed && !clicked && !mouseCapture.mouseDown )
+	//	mouseCapture.lineId = -1;
+
+	if ( !clicked ) {
+		// we hovered a line, but we should only react
+		// to this if it is visible
+		if ( !mouseCapture.mouseDown ) {
+			// we're not dragging a line
+		} else {
+			// we're dragging a line -- update position
+			assert( mouseCapture.lineId >= 0 && mouseCapture.lineId < lines.size() );
+			Vec4i vec = lines[ mouseCapture.lineId ];
+			vec[0] = x; vec[2] = x;
+			lines[ mouseCapture.lineId ] = vec;
+			redraw();
+		}
+	} else {
+		if ( divider < 0 ) {
+			// we clicked "somewhere" - we should create a new line 
+			// and add it to the lines vector
+			Vec4i vec( x, 0, x, src.rows );
+			lines.insert( lines.begin() + lowThreshold, vec );
+			mouseCapture.lineId = lowThreshold;
+			mouseCapture.mouseDown = true;
+			setTrackbarPos( trackbar_name, window_hough, lowThreshold + 1 );
+		} else {
+			// we clicked a visible line -- slide it
+			mouseCapture.lineId = divider;
+			mouseCapture.mouseDown = true;
+			redraw();
+		}
+	}
+
+}
+
+void mouseCallback(int event, int x, int y, int flags, void* userdata)
+{
+	switch( event )
+	{
+	case EVENT_LBUTTONDOWN:
+		{
+			int divider( trackDivider( x, y ) );
+			if ( -1 == divider && !( flags & EVENT_FLAG_SHIFTKEY ) )
+				lookupImage( x, y );
+			else
+				actOnDivider( x, y, divider, true );
+
+			break;
+		}
+	case EVENT_MOUSEMOVE:
+		{
+			int divider( trackDivider( x, y ) );
+
+			if ( divider >= 0 )
+				setCursor( cursor_DragHorz );
+			else if ( flags & EVENT_FLAG_SHIFTKEY )
+				setCursor( cursor_Create );
+			else
+				setCursor( cursor_Normal );
+
+			actOnDivider( x, y, divider, false );
+			break;
+		}
+	case EVENT_LBUTTONUP:
+		{
+			mouseCapture.mouseDown = false;
+			mouseCapture.lineId = -1;
+			break;
+		}
+	}
 }
 
 int _tmain(int argc, _TCHAR* argv[])
@@ -147,7 +267,18 @@ int _tmain(int argc, _TCHAR* argv[])
 		return 1;
 	}
 
-	src = imread( fromUtf16( argv[1] ).c_str(), cv::IMREAD_COLOR );
+	string arg( fromUtf16( argv[1] ) );
+	if ( arg == "--from-clipboard" )
+	{
+		cout << "Reading from clipboard" << endl;
+		imgFromClipboard( src );
+	}
+	else
+	{
+		cout << "Loading file " << arg << endl;
+		src = imread( arg.c_str(), cv::IMREAD_COLOR );
+	}
+
 	if ( !src.data )
 	{
 		cerr << "Cannot read image" << endl;
@@ -168,20 +299,21 @@ int _tmain(int argc, _TCHAR* argv[])
 		tmp.copyTo( src_lab );
 	}
 
-	// In order to grab the "perceptive" difference I need differences
-	// for each channel
-	// Subtract neighbouring pixels with a kernel [1 -1]
-	/*Mat kernel = (Mat_<double>( 3, 3) <<  0,  0,  0,
-										  0,  1, -1,
-										  0,  0,  0); // */
-	Mat kernel = (Mat_<double>( 2, 2) <<  1,  -1,
-										  1,  -1 );   // */
-	filter2D( src_lab, src_diff, CV_32FC3, kernel, Point(0,0) );  // */
 
 	// we have per-channel differences, all it takes now is to square them and add together
 	{
-		Mat mul_mat;
+		Mat mul_mat, src_diff;
 		vector<Mat> chans(3);
+
+		// In order to grab the "perceptive" difference I need differences
+		// for each channel
+		// Subtract neighbouring pixels with a kernel [1 -1]
+		/*Mat kernel = (Mat_<double>( 3, 3) <<  0,  0,  0,
+											  0,  1, -1,
+											  0,  0,  0); // */
+		Mat kernel = (Mat_<double>( 2, 2) <<  1,  -1,
+											  1,  -1 );   // */
+		filter2D( src_lab, src_diff, CV_32FC3, kernel, Point(0,0) );  // */
 
 		// Square + bring to range [0..1]
 		multiply( src_diff, src_diff, mul_mat, 1.0 / 65536, CV_32FC3 );
@@ -201,10 +333,10 @@ int _tmain(int argc, _TCHAR* argv[])
 	performAccum<float>( src_gray );
 
 	//src.copyTo( src_diff );
-	cvtColor( src_gray, src_diff, CV_GRAY2BGR );
-	multiply( src, src_diff, src_diff, 1, CV_8UC1 );
-	namedWindow( "Diff", CV_WINDOW_AUTOSIZE );
-	imshow( "Diff", src_diff );
+	//cvtColor( src_gray, src_diff, CV_GRAY2BGR );
+	//multiply( src_lab, src_diff, src_diff, 1, CV_8UC1 );
+	//namedWindow( "Diff", CV_WINDOW_AUTOSIZE );
+	//imshow( "Diff", src_diff );
 
 	// Guess the number of lines
 	lowThreshold = cvRound( (double)src.cols / src.rows - 0.25 ) - 1;
@@ -213,14 +345,36 @@ int _tmain(int argc, _TCHAR* argv[])
 	//namedWindow( window_canny, CV_WINDOW_AUTOSIZE );
 	namedWindow( window_hough, CV_WINDOW_AUTOSIZE );
 
+
 	// Create a Trackbar for user to enter threshold
-	createTrackbar( "Min Threshold:", window_hough, &lowThreshold, max_lowThreshold, trackbarCallback );
+	createTrackbar( trackbar_name, window_hough, &lowThreshold, max_lowThreshold, trackbarCallback );
 
 	// Detect edges and redisplay image
 	trackbarCallback(0, 0);
 
-	waitKey( 0 );
+	setMouseCallback( window_hough, mouseCallback, NULL );
+
+	int key;
+	while ( ( key = waitKey( 0 ) ) != VK_ESCAPE )
+	{
+		if ( VK_DELETE == key && mouseCapture.mouseDown ) {
+			if ( mouseCapture.lineId >= 0 && mouseCapture.lineId < lines.size() ) {
+				lines.erase( lines.begin() + mouseCapture.lineId );
+				mouseCapture.mouseDown = false;
+				mouseCapture.lineId = -1;
+				if ( lowThreshold > 0 ) --lowThreshold;
+				setTrackbarPos( trackbar_name, window_hough, lowThreshold );
+			}
+		}
+	}
 	
 	return 0;
 }
 
+int WINAPI WinMain ( HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd )
+{
+	LPWSTR* argv;
+	int argc;
+	argv = CommandLineToArgvW( GetCommandLine(), &argc );
+	return _tmain( argc, argv );
+}
